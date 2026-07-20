@@ -1,0 +1,138 @@
+---
+# ============================================================
+# Role: application
+# Purpose: Deploy the Voting Application to Kubernetes
+# ============================================================
+
+- name: Restart CoreDNS to ensure DNS resolution is fresh after cluster init
+  ansible.builtin.command:
+    cmd: kubectl rollout restart deployment/coredns -n kube-system
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  changed_when: true
+
+- name: Wait for CoreDNS to be ready
+  ansible.builtin.command:
+    cmd: kubectl rollout status deployment/coredns -n kube-system --timeout=60s
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  changed_when: false
+
+- name: Pause to allow CoreDNS to begin serving queries
+  ansible.builtin.pause:
+    seconds: 15
+
+- name: Clone or update the Voting Application repository
+  ansible.builtin.git:
+    repo: "{{ app_repo_url }}"
+    dest: "{{ app_repo_dest }}"
+    version: "{{ app_repo_branch }}"
+    force: true
+    update: true
+  become: true
+
+- name: Ensure voting namespace exists
+  ansible.builtin.command:
+    cmd: kubectl create namespace {{ app_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: ns_result
+  changed_when: ns_result.rc == 0
+  failed_when: ns_result.rc != 0 and 'already exists' not in ns_result.stderr
+
+- name: Apply Flask secret from vault
+  ansible.builtin.command:
+    cmd: kubectl apply -f -
+    stdin: "{{ lookup('template', 'flask-secret.yaml.j2') }}"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: secret_result
+  changed_when: "'created' in secret_result.stdout or 'configured' in secret_result.stdout"
+
+- name: Deploy all application manifests
+  ansible.builtin.command:
+    cmd: kubectl apply -n {{ app_namespace }} -f {{ app_repo_dest }}/{{ app_k8s_specs_dir }}/
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: app_deploy
+  changed_when: "'created' in app_deploy.stdout or 'configured' in app_deploy.stdout"
+
+- name: Set vote ballot options (Red vs Blue)
+  ansible.builtin.command:
+    cmd: >
+      kubectl set env deployment/vote -n {{ app_namespace }}
+      OPTION_A={{ vote_option_a }}
+      OPTION_B={{ vote_option_b }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: vote_env
+  changed_when: "'env updated' in vote_env.stdout"
+
+- name: Wait for db pod to be ready before fixing auth
+  ansible.builtin.command:
+    cmd: kubectl rollout status deployment/db -n {{ app_namespace }} --timeout=120s
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  changed_when: false
+
+- name: Fix PostgreSQL auth to allow all connection methods (scram + md5 + trust)
+  ansible.builtin.command:
+    cmd: >
+      kubectl exec -n {{ app_namespace }} deployment/db --
+      bash -c "HBA=$(psql -U postgres -t -c 'SHOW hba_file;' | tr -d ' \n') &&
+      grep -q 'trust' $HBA ||
+      (echo 'host all all 0.0.0.0/0 trust' >> $HBA &&
+      psql -U postgres -c 'SELECT pg_reload_conf();')"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  changed_when: true
+
+- name: Restart worker to ensure it connects with fresh DNS
+  ansible.builtin.command:
+    cmd: kubectl rollout restart deployment/worker -n {{ app_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  changed_when: true
+
+- name: Wait for all pods to be running
+  ansible.builtin.command:
+    cmd: kubectl get pods -n {{ app_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: pods_status
+  retries: 20
+  delay: 20
+  until: >-
+    'Pending' not in pods_status.stdout and
+    'Init:' not in pods_status.stdout and
+    'CrashLoopBackOff' not in pods_status.stdout and
+    'Error' not in pods_status.stdout and
+    '0/' not in pods_status.stdout
+  changed_when: false
+
+- name: Verify worker connected to db and redis
+  ansible.builtin.command:
+    cmd: kubectl logs -n {{ app_namespace }} deployment/worker --tail=20
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: worker_logs
+  retries: 10
+  delay: 10
+  until: "'Connected to db' in worker_logs.stdout and 'Connected to redis' in worker_logs.stdout"
+  changed_when: false
+
+- name: Show pod status
+  ansible.builtin.debug:
+    msg: "{{ pods_status.stdout_lines }}"
+
+- name: Show service endpoints
+  ansible.builtin.command:
+    cmd: kubectl get svc -n {{ app_namespace }}
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: svc_output
+  changed_when: false
+
+- name: Show services
+  ansible.builtin.debug:
+    msg: "{{ svc_output.stdout_lines }}"

@@ -1,0 +1,13 @@
+---
+# --- Cluster networking ------------------------------------------
+pod_network_cidr: "10.244.0.0/16"
+service_cidr: "10.96.0.0/12"
+flannel_manifest_url: "https://raw.githubusercontent.com/flannel-io/flannel/v0.25.1/Documentation/kube-flannel.yml"
+
+# --- API server --------------------------------------------------
+k8s_api_port: 6443
+
+# --- Admin user on master node -----------------------------------
+# Change this if your instances use a different SSH/admin username
+kube_user: "ubuntu"
+kubeconfig_path: "/home/{{ kube_user }}/.kube/config"

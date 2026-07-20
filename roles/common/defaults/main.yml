@@ -1,0 +1,13 @@
+---
+# OS prerequisites
+common_packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gnupg
+  - lsb-release
+  - software-properties-common
+  - git
+  - vim
+  - net-tools
+# k8s_version and k8s_package_version are defined in group_vars/all.yml
